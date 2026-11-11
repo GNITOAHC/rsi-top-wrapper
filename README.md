@@ -6,7 +6,8 @@ Code and prompts for the Anthropic kernel optimization part of
 RSI-top monitors an evolutionary search with a compact metric dashboard. When
 progress stalls, four planners selectively inspect the history, propose new
 directions, and return a parallel cohort of candidates to the native search.
-This release includes **OpenEvolve** and **ShinkaEvolve**, their baseline runners,
+This release includes **OpenEvolve**, **ShinkaEvolve**, and a **Meta-Harness** search
+loop, their baseline runners,
 the M25 dashboard, intervention prompts, and the frozen Anthropic evaluator.
 
 ## Installation
@@ -61,6 +62,20 @@ uv run python run.py baseline \
   --hours 12 --budget 400 --seed 42 --output runs/shinka-baseline
 ```
 
+For Meta-Harness (DeepSeek only), four concurrent Pi proposer sessions each read the
+whole search archive and write one candidate. RSI-top branches from a stopped
+baseline at its first stall, as with OpenEvolve:
+
+```bash
+uv run python run.py baseline \
+  --framework metaharness --provider deepseek \
+  --hours 12 --budget 400 --seed 42 --output runs/mh-baseline
+
+uv run python run.py rsi-top \
+  --framework metaharness --provider deepseek --source runs/mh-baseline \
+  --hours 12 --budget 400 --seed 42 --output runs/mh-rsi
+```
+
 Commands run in the foreground and print the output and log paths. Each command
 requires a **new output directory**, so rerunning an example cannot overwrite an
 earlier experiment. Use `--dry-run` to inspect the model, required environment
@@ -109,6 +124,8 @@ Each run writes `launch.json`, `launcher.log`, and `result.json` at its root.
 | OpenEvolve baseline | `runs/oe-baseline/search/best/best_program.py` |
 | OpenEvolve + RSI-top | `runs/oe-rsi/search/run/best/best_program.py` |
 | Shinka baseline or RSI-top | `runs/<name>/search/best/best_program.py` |
+| Meta-Harness baseline | `runs/mh-baseline/search/best/best_program.py` |
+| Meta-Harness + RSI-top | `runs/mh-rsi/search/run/best/best_program.py` |
 
 Re-score any candidate without an API key:
 
@@ -137,6 +154,14 @@ into a temporary clean checkout, copies only the candidate, and runs the unmodif
 `--correctness-only` to skip the thresholds, or `--local-repo PATH` to verify
 offline against a local clone of that commit. The harness executes candidate
 Python directly; use trusted candidates or a separate sandbox.
+
+To export one results panel (best score so far, intervention dots, stalls, and cost)
+in the project site's format from a baseline and the RSI-top run forked from it:
+
+```bash
+uv run python export_frontier.py --name "Meta-Harness · DeepSeek v4 Flash" \
+  --baseline runs/mh-baseline --rsi runs/mh-rsi
+```
 
 ## Tests
 

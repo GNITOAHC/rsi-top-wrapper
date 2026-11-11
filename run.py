@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 INTEGRATIONS = {
     "openevolve": ROOT / "integrations/openevolve-takehome",
     "shinka": ROOT / "integrations/shinka-takehome",
+    "metaharness": ROOT / "integrations/metaharness-takehome",
 }
 MODELS = {"deepseek": "deepseek-v4-flash", "gemini": "gemini-3.1-pro-preview"}
 KEYS = {"deepseek": "DEEPSEEK_API_KEY", "gemini": "GEMINI_API_KEY"}
@@ -47,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
         if method == "baseline":
             q.add_argument("--iterations", type=int, help="optional finite iteration/generation cap")
         else:
-            q.add_argument("--source", type=Path, help="optional stopped OpenEvolve baseline from this release")
+            q.add_argument("--source", type=Path, help="optional stopped OpenEvolve or Meta-Harness baseline from this release")
             q.add_argument("--cutoff", type=int, help="explicit completion sequence in --source")
     return p
 
@@ -65,6 +66,8 @@ def plan(args: argparse.Namespace) -> dict:
     folder = INTEGRATIONS[args.framework]
     output = args.output.expanduser().resolve()
     model = args.model or MODELS[args.provider]
+    if args.framework == "metaharness" and args.provider != "deepseek":
+        raise ValueError("the Meta-Harness integration supports --provider deepseek only")
     if args.seed < 0:
         raise ValueError("--seed must be non-negative")
     if args.command == "baseline" and args.iterations is not None and args.iterations < 1:
@@ -82,6 +85,12 @@ def plan(args: argparse.Namespace) -> dict:
                        "--wall-time-seconds", str(args.hours * 3600)]
             if args.iterations is not None:
                 command += ["--iterations", str(args.iterations)]
+        elif args.framework == "metaharness":
+            if args.iterations is not None:
+                raise ValueError("--iterations is not supported by the Meta-Harness integration")
+            command = [sys.executable, str(folder / "mh_loop.py"), *common,
+                       "--worker-model", model, "--worker-reasoning", "high",
+                       "--wall-time-seconds", str(args.hours * 3600)]
         else:
             command = [sys.executable, str(folder / "run_evo.py"), *common,
                        "--llm-model", model, "--effort", "high", "--resume-capture"]
@@ -89,15 +98,15 @@ def plan(args: argparse.Namespace) -> dict:
                 command += ["--generations", str(args.iterations)]
     else:
         required.add("DEEPSEEK_API_KEY")
-        if args.source and args.framework != "openevolve":
-            raise ValueError("--source is supported by the OpenEvolve launcher; Shinka starts from scratch")
+        if args.source and args.framework == "shinka":
+            raise ValueError("--source is supported by the OpenEvolve and Meta-Harness launchers; Shinka starts from scratch")
         if args.cutoff is not None and (not args.source or args.cutoff < 1):
             raise ValueError("a positive --cutoff requires --source")
         command = [sys.executable, str(folder / "run_repeat_flat_breadth.py"), *common,
                    "--worker-model", model, "--worker-reasoning", "high",
                    "--wall-time-seconds", str(args.hours * 3600),
                    "--minimum-run-age-seconds", "3600"]
-        if args.framework == "openevolve":
+        if args.framework in ("openevolve", "metaharness"):
             command += ["--worker-provider", args.provider]
             if args.source:
                 source = args.source.expanduser().resolve()
@@ -132,7 +141,7 @@ def execute(spec: dict, env: dict[str, str]) -> int:
     missing = [name for name in spec["required_environment"] if not env.get(name)]
     if missing:
         raise ValueError("set " + ", ".join(missing))
-    if spec["method"] == "rsi-top":
+    if spec["method"] == "rsi-top" or spec["framework"] == "metaharness":
         if not Path(env["AUDIT_PI_CLI"]).is_file():
             raise ValueError("Pi runtime missing; run ./setup.sh")
         check_node()

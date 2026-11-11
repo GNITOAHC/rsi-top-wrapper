@@ -24,7 +24,8 @@ def _runtime_paths(root: Path) -> set[Path]:
     paths = {root / name for name in REQUIRED_ROOT_FILES}
     # Only direct integration files: run outputs can be arbitrarily large and
     # contain credentials or generated programs, and are not release sources.
-    for relative in (".", "shared/meta-agent-audit", "integrations/openevolve-takehome", "integrations/shinka-takehome"):
+    for relative in (".", "shared/meta-agent-audit", "integrations/openevolve-takehome", "integrations/shinka-takehome",
+                     "integrations/metaharness-takehome"):
         directory = root / relative
         if not directory.is_dir():
             raise FileNotFoundError(directory)

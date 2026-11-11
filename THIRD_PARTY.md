@@ -5,6 +5,7 @@
 | OpenEvolve | [algorithmicsuperintelligence/openevolve](https://github.com/algorithmicsuperintelligence/openevolve) | [Apache-2.0](integrations/openevolve-takehome/vendor/openevolve/LICENSE) |
 | ShinkaEvolve | [SakanaAI/ShinkaEvolve](https://github.com/SakanaAI/ShinkaEvolve) | [Apache-2.0](integrations/shinka-takehome/vendor/shinkaevolve/LICENSE) |
 | Anthropic performance takehome | [anthropics/original_performance_takehome](https://github.com/anthropics/original_performance_takehome) | Original source notices retained; [snapshot notes](integrations/openevolve-takehome/vendor/takehome/Readme.md) |
+| Meta-Harness | [stanford-iris-lab/meta-harness](https://github.com/stanford-iris-lab/meta-harness) | MIT; search loop reimplemented and proposer prompt adapted in [integrations/metaharness-takehome](integrations/metaharness-takehome) and [prompts/worker_metaharness.md](prompts/worker_metaharness.md); no upstream code vendored |
 | Pi coding agent | [earendil-works/pi](https://github.com/earendil-works/pi) | MIT; installed separately from the pinned npm dependency |
 
 The bundled OpenEvolve and ShinkaEvolve trees include experiment-specific

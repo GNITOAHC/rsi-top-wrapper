@@ -7,7 +7,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 for relative in (".", "shared/meta-agent-audit", "integrations/openevolve-takehome",
-                 "integrations/shinka-takehome"):
+                 "integrations/shinka-takehome", "integrations/metaharness-takehome"):
     sys.path.insert(0, str(ROOT / relative))
 
 
