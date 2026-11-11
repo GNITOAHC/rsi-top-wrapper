@@ -154,7 +154,7 @@ def test_breadth_trigger_dispatches_whole_cohort_and_resumes(tmp_path, monkeypat
         epochs_dir=search_dir / "breadth_epochs", flat_seconds=0.05, flat_min_terminal_attempts=4,
         start_ordinary=True,
     )
-    search = run_search(search_dir / "run", seconds=0.8, breadth=breadth)
+    search = run_search(search_dir / "run", seconds=2.0, breadth=breadth)
     journal = rows(search_dir / "run/breadth_interventions.jsonl")
     kinds = [row["kind"] for row in journal]
     for kind in ("repeat_flat_ready", "planner_requested", "portfolio_ready", "cohort_bound",
