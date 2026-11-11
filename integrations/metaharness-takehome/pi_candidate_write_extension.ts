@@ -1,13 +1,20 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-type ExtensionAPI = { registerTool(tool: any): void };
+type ExtensionAPI = { registerTool(tool: any): void; on?(event: string, handler: (event: any) => any): void };
 
 // The only writable location: fixed names under the session workspace.
 const OUT = resolve(process.cwd(), "out");
 const MAX_CODE_CHARS = 60000;
+// OpenEvolve's llm.max_tokens; without it DeepSeek truncates each turn at its 64K default.
+const MAX_OUTPUT_TOKENS = 128000;
 
 export default function (pi: ExtensionAPI) {
+	pi.on?.("before_provider_request", (event) =>
+		event?.payload && event.payload.max_tokens === undefined
+			? { ...event.payload, max_tokens: MAX_OUTPUT_TOKENS }
+			: undefined,
+	);
 	pi.registerTool({
 		name: "write_candidate",
 		label: "Write candidate program",

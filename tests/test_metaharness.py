@@ -237,7 +237,8 @@ def test_candidate_write_tool_only_writes_fixed_outputs(tmp_path):
     extension = ROOT / "integrations/metaharness-takehome/pi_candidate_write_extension.ts"
     script.write_text(
         f"import register from {json.dumps(str(extension))};\n"
-        "let tool; register({registerTool(t) { tool = t; }});\n"
+        "let tool, hook; register({registerTool(t) { tool = t; }, on(name, h) { hook = h; }});\n"
+        "console.log('max_tokens', hook({payload: {model: 'm'}}).max_tokens);\n"
         "await tool.execute('1', {code: 'x = 1\\n', base_id: '../../etc', changes: 'c'});\n"
         "try { await tool.execute('2', {code: 'y'.repeat(60001), base_id: 'root', changes: 'c'}); "
         "console.log('accepted-long'); } catch { console.log('rejected-long'); }\n"
@@ -247,7 +248,7 @@ def test_candidate_write_tool_only_writes_fixed_outputs(tmp_path):
     if "ERR_UNKNOWN_FILE_EXTENSION" in result.stderr:
         pytest.skip("node cannot load TypeScript")
     assert result.returncode == 0, result.stderr
-    assert "rejected-long" in result.stdout
+    assert "rejected-long" in result.stdout and "max_tokens 128000" in result.stdout
     assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["candidate.py", "pending.json"]
     assert (tmp_path / "out/candidate.py").read_text() == "x = 1\n"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["harness.mjs", "out"]
