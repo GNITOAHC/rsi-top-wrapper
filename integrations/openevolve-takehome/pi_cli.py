@@ -25,6 +25,7 @@ PI_TOOLS = "read,grep,compare_attempts"
 PI_COMPARE_EXTENSION = Path(__file__).with_name("pi_compare_attempts_extension.ts")
 
 PROVIDER_API_KEY_ENVS = {
+    "cloudflare": "CLOUDFLARE_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
     "google": "GEMINI_API_KEY",
@@ -50,6 +51,51 @@ if not PI_API_KEY_ENV:
     raise ValueError(
         f"no API-key environment variable is configured for provider {PI_PROVIDER!r}"
     )
+
+
+# DeepSeek V4.1 Flash on Cloudflare Workers AI, priced per 1M tokens as billed there.
+CLOUDFLARE_MODEL = "@cf/deepseek-ai/deepseek-v4.1-flash-1017"
+CLOUDFLARE_PRICE = {"input": 0.30, "cacheRead": 0.006, "output": 1.20}
+
+
+def cloudflare_base_url() -> str:
+    return (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{os.environ['CLOUDFLARE_ACCOUNT_ID']}/ai/v1"
+    )
+
+
+def cloudflare_provider_config(model: str = CLOUDFLARE_MODEL) -> dict[str, Any]:
+    """Pi models.json provider for Cloudflare's OpenAI-compatible, streamed endpoint."""
+    if model != CLOUDFLARE_MODEL:
+        raise ValueError(f"the Cloudflare key is restricted to {CLOUDFLARE_MODEL}")
+    return {
+        "baseUrl": cloudflare_base_url(),
+        "api": "openai-completions",
+        "apiKey": "$CLOUDFLARE_API_KEY",
+        "models": [
+            {
+                "id": model,
+                "name": f"{model} via Cloudflare",
+                "reasoning": True,
+                "input": ["text"],
+                "contextWindow": 1_000_000,
+                "maxTokens": 128_000,
+                "cost": {
+                    "input": CLOUDFLARE_PRICE["input"],
+                    "output": CLOUDFLARE_PRICE["output"],
+                    "cacheRead": CLOUDFLARE_PRICE["cacheRead"],
+                    "cacheWrite": CLOUDFLARE_PRICE["input"],
+                },
+                "thinkingLevelMap": {"high": "high"},
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": True,
+                    "maxTokensField": "max_tokens",
+                },
+            }
+        ],
+    }
 
 
 def remove_python_bytecode(root: Path) -> None:
@@ -140,6 +186,13 @@ def build_pi_subprocess_env(
             encoding="utf-8",
         )
         env["OPENAI_BASE_URL"] = base_url
+    if effective_provider == "cloudflare":
+        agent_dir = home / ".pi" / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / "models.json").write_text(
+            json.dumps({"providers": {"cloudflare": cloudflare_provider_config()}}) + "\n",
+            encoding="utf-8",
+        )
 
     if extra:
         env.update(extra)

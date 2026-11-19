@@ -49,4 +49,15 @@ def test_metaharness_fork_dry_run_targets_the_baseline_search(tmp_path):
 def test_metaharness_rejects_other_providers(tmp_path):
     result = dry_run(tmp_path, "baseline", "--framework", "metaharness", "--provider", "gemini",
                      "--output", str(tmp_path / "run"))
-    assert result.returncode == 2 and "deepseek only" in result.stderr
+    assert result.returncode == 2 and "deepseek or cloudflare only" in result.stderr
+
+
+def test_metaharness_cloudflare_routes_worker_and_planner(tmp_path):
+    result = dry_run(tmp_path, "rsi-top", "--framework", "metaharness", "--provider", "cloudflare",
+                     "--output", str(tmp_path / "run"))
+    spec, _ = json.JSONDecoder().raw_decode(result.stdout)
+    command = spec["command"]
+    assert command[command.index("--worker-provider") + 1] == "cloudflare"
+    assert command[command.index("--worker-model") + 1] == "@cf/deepseek-ai/deepseek-v4.1-flash-1017"
+    assert spec["required_environment"] == ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY"]
+    assert spec["planner"]["provider"] == "cloudflare"

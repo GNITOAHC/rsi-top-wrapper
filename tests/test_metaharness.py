@@ -252,3 +252,17 @@ def test_candidate_write_tool_only_writes_fixed_outputs(tmp_path):
     assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["candidate.py", "pending.json"]
     assert (tmp_path / "out/candidate.py").read_text() == "x = 1\n"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["harness.mjs", "out"]
+
+
+def test_cloudflare_price_and_model_lock(tmp_path, monkeypatch):
+    ledger = mh_loop.CloudflareCostLedger(str(tmp_path / "ledger.json"))
+    million = {"input_tokens": 10**6, "cached_input_tokens": 10**6, "output_tokens": 10**6}
+    assert ledger.price(million) == pytest.approx(0.30 + 0.006 + 1.20)
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    import pi_cli
+
+    config = pi_cli.cloudflare_provider_config()
+    assert config["baseUrl"] == "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1"
+    assert config["models"][0]["id"] == "@cf/deepseek-ai/deepseek-v4.1-flash-1017"
+    with pytest.raises(ValueError):
+        pi_cli.cloudflare_provider_config("openai/gpt-4.1")

@@ -82,27 +82,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initial-completion-seq", type=int)
     parser.add_argument("--budget", type=float, default=400.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--worker-provider", choices=["deepseek"], default="deepseek")
+    parser.add_argument("--worker-provider", choices=["deepseek", "cloudflare"], default="deepseek")
     parser.add_argument("--worker-model", default="deepseek-v4-flash")
     parser.add_argument("--worker-reasoning", default="high")
     parser.add_argument("--wall-time-seconds", type=float, default=12 * 3600.0)
     parser.add_argument("--minimum-run-age-seconds", type=float, default=3600.0)
     parser.add_argument("--flat-seconds", type=float, default=1200.0)
     parser.add_argument("--flat-min-terminal-attempts", type=int, default=12)
-    parser.add_argument("--planner-model", default="deepseek-v4-flash")
-    parser.add_argument("--planner-provider", default="deepseek")
+    # Planner and dedup default to the worker's provider (DeepSeek v4 Flash on either endpoint).
+    parser.add_argument("--planner-model")
+    parser.add_argument("--planner-provider")
     parser.add_argument("--planner-reasoning", default="high")
-    parser.add_argument("--planner-base-url", default="https://api.deepseek.com")
-    parser.add_argument("--planner-api-key-env", default="DEEPSEEK_API_KEY")
+    parser.add_argument("--planner-base-url")
+    parser.add_argument("--planner-api-key-env")
     parser.add_argument("--metric-subspace-seed", type=int, default=20260830)
     parser.add_argument("--pi", default=mh_loop.os.environ.get("AUDIT_PI_CLI", "pi"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.worker_provider == "cloudflare":
+        defaults = {"model": mh_loop.CLOUDFLARE_MODEL, "provider": "cloudflare",
+                    "base_url": mh_loop.cloudflare_base_url(), "api_key_env": "CLOUDFLARE_API_KEY"}
+    else:
+        defaults = {"model": "deepseek-v4-flash", "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"}
+    for key, value in defaults.items():
+        if getattr(args, f"planner_{key}") is None:
+            setattr(args, f"planner_{key}", value)
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     started_at = time.time()
     args = parse_args(argv)
-    pi = mh_loop.check_environment(args.pi)
+    pi = mh_loop.check_environment(args.pi, args.worker_provider)
     output = args.output.resolve()
     if output.exists():
         raise SystemExit(f"output already exists: {output}")
@@ -164,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     search = mh_loop.Search(
         output=run, budget=args.budget, worker_model=args.worker_model, worker_reasoning=args.worker_reasoning,
         pi=pi, wall_time_seconds=args.wall_time_seconds, seed=args.seed, breadth=breadth,
+        worker_provider=args.worker_provider,
     )
     search.setup(prefix)
     asyncio.run(search.run())

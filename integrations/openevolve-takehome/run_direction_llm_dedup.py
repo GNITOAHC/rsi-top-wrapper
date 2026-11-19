@@ -174,12 +174,24 @@ def deduplicate_directions(
     for attempt in range(1, DEFAULT_VALIDATION_ATTEMPTS + 1):
         attempt_output = output / f"attempt_{attempt}"
         attempt_output.mkdir()
-        response = client.chat.completions.create(
+        request = dict(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             max_tokens=max_tokens,
         )
+        if client.base_url.host == "api.cloudflare.com":
+            # Cloudflare Workers AI is called streamed only; rebuild the completion.
+            from openai.lib.streaming.chat import ChatCompletionStreamState
+
+            state = ChatCompletionStreamState()
+            for chunk in client.chat.completions.create(
+                **request, stream=True, stream_options={"include_usage": True}
+            ):
+                state.handle_chunk(chunk)
+            response = state.get_final_completion()
+        else:
+            response = client.chat.completions.create(**request)
         raw = (
             json.dumps(response.model_dump(mode="json"), indent=2, sort_keys=True)
             + "\n"

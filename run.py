@@ -20,8 +20,9 @@ INTEGRATIONS = {
     "shinka": ROOT / "integrations/shinka-takehome",
     "metaharness": ROOT / "integrations/metaharness-takehome",
 }
-MODELS = {"deepseek": "deepseek-v4-flash", "gemini": "gemini-3.1-pro-preview"}
-KEYS = {"deepseek": "DEEPSEEK_API_KEY", "gemini": "GEMINI_API_KEY"}
+MODELS = {"deepseek": "deepseek-v4-flash", "gemini": "gemini-3.1-pro-preview",
+          "cloudflare": "@cf/deepseek-ai/deepseek-v4.1-flash-1017"}
+KEYS = {"deepseek": "DEEPSEEK_API_KEY", "gemini": "GEMINI_API_KEY", "cloudflare": "CLOUDFLARE_API_KEY"}
 
 
 def positive(value: str) -> float:
@@ -66,14 +67,18 @@ def plan(args: argparse.Namespace) -> dict:
     folder = INTEGRATIONS[args.framework]
     output = args.output.expanduser().resolve()
     model = args.model or MODELS[args.provider]
-    if args.framework == "metaharness" and args.provider != "deepseek":
-        raise ValueError("the Meta-Harness integration supports --provider deepseek only")
+    if args.framework == "metaharness" and args.provider == "gemini":
+        raise ValueError("the Meta-Harness integration supports --provider deepseek or cloudflare only")
+    if args.framework != "metaharness" and args.provider == "cloudflare":
+        raise ValueError("--provider cloudflare is supported by the Meta-Harness integration only")
     if args.seed < 0:
         raise ValueError("--seed must be non-negative")
     if args.command == "baseline" and args.iterations is not None and args.iterations < 1:
         raise ValueError("--iterations must be positive")
     common = ["--output", str(output / "search"), "--budget", str(args.budget), "--seed", str(args.seed)]
     required = {KEYS[args.provider]}
+    if args.provider == "cloudflare":
+        required.add("CLOUDFLARE_ACCOUNT_ID")
     # The recorded Shinka profile stores OpenRouter embeddings for each candidate.
     if args.framework == "shinka":
         required.add("OPENROUTER_API_KEY")
@@ -89,6 +94,7 @@ def plan(args: argparse.Namespace) -> dict:
             if args.iterations is not None:
                 raise ValueError("--iterations is not supported by the Meta-Harness integration")
             command = [sys.executable, str(folder / "mh_loop.py"), *common,
+                       "--worker-provider", args.provider,
                        "--worker-model", model, "--worker-reasoning", "high",
                        "--wall-time-seconds", str(args.hours * 3600)]
         else:
@@ -97,7 +103,8 @@ def plan(args: argparse.Namespace) -> dict:
             if args.iterations is not None:
                 command += ["--generations", str(args.iterations)]
     else:
-        required.add("DEEPSEEK_API_KEY")
+        if args.provider != "cloudflare":  # the planner shares the Cloudflare worker's key
+            required.add("DEEPSEEK_API_KEY")
         if args.source and args.framework == "shinka":
             raise ValueError("--source is supported by the OpenEvolve and Meta-Harness launchers; Shinka starts from scratch")
         if args.cutoff is not None and (not args.source or args.cutoff < 1):
@@ -128,7 +135,8 @@ def plan(args: argparse.Namespace) -> dict:
         "model": model, "seed": args.seed, "hours": args.hours,
         "worker_budget_usd": args.budget, "output": str(output),
         "required_environment": sorted(required), "command": command,
-        "planner": ({"provider": "deepseek", "model": "deepseek-v4-flash",
+        "planner": ({"provider": "cloudflare" if args.provider == "cloudflare" else "deepseek",
+                     "model": MODELS["cloudflare" if args.provider == "cloudflare" else "deepseek"],
                      "calls": 4, "directions_per_call": 8, "metrics_per_call": 15,
                      "routing": "shared", "selector": "llm"} if args.command == "rsi-top" else None),
     }

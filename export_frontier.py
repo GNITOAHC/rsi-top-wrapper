@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parent
 OE = ROOT / "integrations" / "openevolve-takehome"
 NORMALIZER = 1363.0
 MEANINGFUL_RELATIVE_GAIN = 0.002
-FLASH_PRICE = (0.14, 0.28)  # deepseek-v4-flash USD per 1M input/output tokens (dedup calls)
+# USD per 1M input/output tokens of the dedup calls, by planner provider.
+DEDUP_PRICE = {"deepseek": (0.14, 0.28), "cloudflare": (0.30, 1.20)}
 DELIVERED = {"portfolio_ready", "overlap_portfolio_ready"}
 
 
@@ -168,8 +169,9 @@ def cost_until(baseline: Trace, rsi: Trace, rsi_run: Path, fork_hour: float, hor
         run = json.loads(run_json.read_text(encoding="utf-8"))
         dedup = run.get("dedup_usage") or {}
         planner += float((run.get("usage") or {}).get("catalog_cost_estimate_usd") or 0.0)
-        planner += (int(dedup.get("input_tokens") or 0) * FLASH_PRICE[0]
-                    + int(dedup.get("output_tokens") or 0) * FLASH_PRICE[1]) / 1e6
+        price = DEDUP_PRICE[run.get("provider") or "deepseek"]
+        planner += (int(dedup.get("input_tokens") or 0) * price[0]
+                    + int(dedup.get("output_tokens") or 0) * price[1]) / 1e6
     return sum(worker) + planner
 
 

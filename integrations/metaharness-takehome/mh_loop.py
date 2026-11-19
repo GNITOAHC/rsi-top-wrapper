@@ -19,6 +19,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import re
 import os
 import shutil
 import signal
@@ -43,8 +44,11 @@ os.environ.setdefault("AUDIT_PI_API_KEY_ENV", "DEEPSEEK_API_KEY")
 
 import evaluator as oe_evaluator  # noqa: E402
 from deepseek_llm import DeepSeekCostLedger  # noqa: E402
+from gemini_llm import GeminiCostLedger  # noqa: E402
 from meta_audit.source_snapshot import capture_sources, write_source_snapshot  # noqa: E402
-from pi_cli import build_pi_argv, build_pi_subprocess_env, parse_pi_stream  # noqa: E402
+from pi_cli import (  # noqa: E402
+    CLOUDFLARE_MODEL, CLOUDFLARE_PRICE, PROVIDER_API_KEY_ENVS, cloudflare_base_url, build_pi_argv, build_pi_subprocess_env, parse_pi_stream,
+)
 
 WORKER_PROMPT = ROOT / "prompts" / "worker_metaharness.md"
 ROOT_PROGRAM = OE / "initial_program.py"
@@ -55,6 +59,8 @@ NATIVE_CONCURRENCY = 4  # matches OpenEvolve/Shinka ordinary concurrency
 PI_TIMEOUT_SECONDS = 3600.0  # one multi-turn session; OpenEvolve allows 2400 s per single call
 MAX_CODE_CHARS = 60000  # OpenEvolve max_code_length
 ROOT_ID = "root"
+# Key revoked, expired or out of balance: every later session would fail the same way.
+FATAL_API_ERROR = re.compile(r'"errorMessage":"40[123]\b')
 ORDINARY_MESSAGE = (
     "Run one Meta-Harness proposal step: read the archive in the working "
     "directory, then call write_candidate exactly once with one new program."
@@ -120,6 +126,24 @@ def evaluate_program(path: Path) -> tuple[bool, dict[str, Any], dict[str, Any]]:
     return "failure_stage" not in artifacts, metrics, artifacts
 
 
+class CloudflareCostLedger(GeminiCostLedger):
+    """Workers AI price: cache reads are billed apart from uncached input."""
+
+    USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
+    COST_BASIS = "cloudflare_workers_ai_price"
+    PRICE = {
+        "input_tokens": CLOUDFLARE_PRICE["input"] / 1e6,
+        "cached_input_tokens": CLOUDFLARE_PRICE["cacheRead"] / 1e6,
+        "output_tokens": CLOUDFLARE_PRICE["output"] / 1e6,
+    }
+
+
+def make_ledger(provider: str, path: Path, model: str) -> GeminiCostLedger:
+    if provider == "cloudflare":
+        return CloudflareCostLedger(str(path))
+    return DeepSeekCostLedger(str(path), model=model)
+
+
 class Search:
     def __init__(
         self,
@@ -129,6 +153,7 @@ class Search:
         worker_model: str,
         worker_reasoning: str,
         pi: str,
+        worker_provider: str = "deepseek",
         wall_time_seconds: float,
         seed: int,
         breadth: Any = None,
@@ -136,6 +161,7 @@ class Search:
         self.output = output
         self.budget = float(budget)
         self.worker_model = worker_model
+        self.worker_provider = worker_provider
         self.worker_reasoning = worker_reasoning
         self.pi = pi
         self.seed = seed
@@ -143,7 +169,7 @@ class Search:
         self.breadth = breadth
         self.archive = output / "archive"
         self.trace = Trace(output / "attempts.jsonl", str(uuid.uuid4()))
-        self.ledger = DeepSeekCostLedger(str(output / "cost_ledger.json"), model=worker_model)
+        self.ledger = make_ledger(worker_provider, output / "cost_ledger.json", worker_model)
         self.pool = ThreadPoolExecutor(max_workers=48)
         self.programs: dict[str, dict[str, Any]] = {}
         self.summary: list[dict[str, Any]] = []
@@ -260,7 +286,7 @@ class Search:
             "argv": sys.argv,
             "created_at": time.time(),
             "budget_usd": self.budget,
-            "worker": {"provider": "deepseek", "model": self.worker_model, "reasoning": self.worker_reasoning},
+            "worker": {"provider": self.worker_provider, "model": self.worker_model, "reasoning": self.worker_reasoning},
             "native_concurrency": NATIVE_CONCURRENCY,
             "random_seed": self.seed,
             "branch_prefix": str(prefix) if prefix else None,
@@ -305,10 +331,10 @@ class Search:
         argv = build_pi_argv(
             self.worker_model, str(self.output / "system_prompt.txt"), self.pi,
             extra_extensions=PI_EXTENSIONS, tools=PI_TOOLS, user_message=message,
-            provider="deepseek", reasoning=self.worker_reasoning,
+            provider=self.worker_provider, reasoning=self.worker_reasoning,
         )
-        env = build_pi_subprocess_env(self.pi, home=home, tmpdir=tmp, provider="deepseek",
-                                      api_key_env="DEEPSEEK_API_KEY")
+        env = build_pi_subprocess_env(self.pi, home=home, tmpdir=tmp, provider=self.worker_provider,
+                                      api_key_env=PROVIDER_API_KEY_ENVS[self.worker_provider])
         stdout_path = workspace / "pi.jsonl"
         with stdout_path.open("w") as stdout, (workspace / "pi.stderr.txt").open("w") as stderr:
             process = await asyncio.create_subprocess_exec(
@@ -324,8 +350,12 @@ class Search:
                     except ProcessLookupError:
                         pass
                     await process.wait()
-        stream = parse_pi_stream(stdout_path.read_text(encoding="utf-8", errors="replace"))
+        text = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stream = parse_pi_stream(text)
         stream["returncode"] = process.returncode
+        if FATAL_API_ERROR.search(text):
+            (self.output / "fatal_api_error.txt").write_text(f"{stdout_path}\n", encoding="utf-8")
+            self._stop.set()
         return stream
 
     def _message(self, guidance: dict[str, Any] | None) -> str:
@@ -362,11 +392,14 @@ class Search:
         except Exception:
             failure = "proposal_failed"
             (workspace / "loop_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        cached = int(stream.get("cache_read_tokens") or 0)
         usage = {
-            "input_tokens": int(stream.get("input_tokens") or 0)
-            + int(stream.get("cache_read_tokens") or 0) + int(stream.get("cache_write_tokens") or 0),
+            "input_tokens": int(stream.get("input_tokens") or 0) + int(stream.get("cache_write_tokens") or 0),
+            "cached_input_tokens": cached,
             "output_tokens": int(stream.get("output_tokens") or 0),
         }
+        if self.worker_provider == "deepseek":  # OpenEvolve's DeepSeek ledger prices cache reads as input
+            usage = {"input_tokens": usage["input_tokens"] + cached, "output_tokens": usage["output_tokens"]}
         cost = self.ledger.price(usage)
         self.ledger.add(usage)
 
@@ -544,6 +577,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--budget", type=float, default=400.0, help="worker API budget estimate in USD")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--worker-provider", choices=("deepseek", "cloudflare"), default="deepseek")
     parser.add_argument("--worker-model", default="deepseek-v4-flash")
     parser.add_argument("--worker-reasoning", default="high")
     parser.add_argument("--wall-time-seconds", type=float, default=12 * 3600.0)
@@ -552,9 +586,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def check_environment(pi: str) -> str:
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        raise SystemExit("DEEPSEEK_API_KEY is not set")
+def check_environment(pi: str, provider: str = "deepseek") -> str:
+    keys = {"deepseek": ["DEEPSEEK_API_KEY"], "cloudflare": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID"]}
+    for key in keys[provider]:
+        if not os.environ.get(key):
+            raise SystemExit(f"{key} is not set")
     resolved = shutil.which(pi)
     if resolved is None:
         raise SystemExit(f"Pi runtime not found: {pi}; run ./setup.sh")
@@ -563,14 +599,14 @@ def check_environment(pi: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    pi = check_environment(args.pi)
+    pi = check_environment(args.pi, args.worker_provider)
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         raise SystemExit(f"output already exists: {output}")
     search = Search(
         output=output, budget=args.budget, worker_model=args.worker_model,
         worker_reasoning=args.worker_reasoning, pi=pi, wall_time_seconds=args.wall_time_seconds,
-        seed=args.seed,
+        seed=args.seed, worker_provider=args.worker_provider,
     )
     search.setup(args.prefix)
     asyncio.run(search.run())

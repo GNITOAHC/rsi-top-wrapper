@@ -1020,7 +1020,7 @@ def run_pi(
     )
     config_dir = home / ".pi" / "agent"
     config_dir.mkdir(parents=True, exist_ok=True)
-    if provider != "deepseek":
+    if provider not in ("deepseek", "cloudflare"):  # both configured by build_pi_subprocess_env
         if provider == "google":
             (config_dir / "settings.json").write_text(
                 json.dumps(
