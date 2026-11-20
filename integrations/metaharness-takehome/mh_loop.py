@@ -61,6 +61,13 @@ MAX_CODE_CHARS = 60000  # OpenEvolve max_code_length
 ROOT_ID = "root"
 # Key revoked, expired or out of balance: every later session would fail the same way.
 FATAL_API_ERROR = re.compile(r'"errorMessage":"40[123]\b')
+# Rate limit or a call cut by the provider: the session is rerun after a backoff.
+RETRYABLE_API_ERROR = re.compile(r'"errorMessage":"(408|429)\b')
+RETRY_DELAYS_SECONDS = (30.0, 60.0, 120.0, 240.0, 480.0)
+# Cloudflare rejects bursts: a 32-direction cohort runs at most 8 sessions at a time,
+# started a few seconds apart (OpenEvolve/Shinka start the whole cohort at once).
+MAX_PI_SESSIONS = 8
+LAUNCH_SPACING_SECONDS = 3.0
 ORDINARY_MESSAGE = (
     "Run one Meta-Harness proposal step: read the archive in the working "
     "directory, then call write_candidate exactly once with one new program."
@@ -178,6 +185,7 @@ class Search:
         self.next_iteration = 0
         self._stop = asyncio.Event()
         self._running: dict[asyncio.Task, dict[str, Any]] = {}
+        self._last_launch = float("-inf")
 
     # ---------- state and archive ----------
 
@@ -353,10 +361,26 @@ class Search:
         text = stdout_path.read_text(encoding="utf-8", errors="replace")
         stream = parse_pi_stream(text)
         stream["returncode"] = process.returncode
+        stream["retryable"] = bool(RETRYABLE_API_ERROR.search(text))
         if FATAL_API_ERROR.search(text):
             (self.output / "fatal_api_error.txt").write_text(f"{stdout_path}\n", encoding="utf-8")
             self._stop.set()
         return stream
+
+    def _charge(self, stream: dict[str, Any], total: dict[str, int]) -> float:
+        """Record one session's tokens in the ledger and add them to the attempt's usage."""
+        cached = int(stream.get("cache_read_tokens") or 0)
+        usage = {
+            "input_tokens": int(stream.get("input_tokens") or 0) + int(stream.get("cache_write_tokens") or 0),
+            "cached_input_tokens": cached,
+            "output_tokens": int(stream.get("output_tokens") or 0),
+        }
+        if self.worker_provider == "deepseek":  # OpenEvolve's DeepSeek ledger prices cache reads as input
+            usage = {"input_tokens": usage["input_tokens"] + cached, "output_tokens": usage["output_tokens"]}
+        self.ledger.add(usage)
+        for key, value in usage.items():
+            total[key] = total.get(key, 0) + value
+        return self.ledger.price(usage)
 
     def _message(self, guidance: dict[str, Any] | None) -> str:
         if guidance is None:
@@ -370,38 +394,51 @@ class Search:
             self.breadth.on_scheduled(attempt_id, iteration, scheduled_at, guidance)
         workspace = self.output / "workspaces" / f"{iteration:05d}"
         workspace.mkdir(parents=True)
-        shutil.copytree(self.archive, workspace / "view")
-        (workspace / "view" / "out").mkdir()
         stream: dict[str, Any] = {}
         terminal, failure, code, pending = "worker_error", None, None, {}
+        usage: dict[str, int] = {}
+        cost = 0.0
+        tries = 0
         try:
-            try:
-                stream = await self._run_pi(workspace, self._message(guidance))
-            except asyncio.TimeoutError:
-                failure = "proposal_timeout"
-            out = workspace / "view" / "out"
-            if failure is None and (out / "candidate.py").is_file() and (out / "pending.json").is_file():
-                code = (out / "candidate.py").read_text(encoding="utf-8")
-                pending = json.loads((out / "pending.json").read_text(encoding="utf-8"))
-            elif failure is None:
-                failure = "proposal_failed"
+            while True:
+                # Each try is a fresh session on the current archive; earlier tries' logs are kept.
+                tries += 1
+                failure, stream = None, {}
+                shutil.copytree(self.archive, workspace / "view")
+                (workspace / "view" / "out").mkdir()
+                try:
+                    try:
+                        stream = await self._run_pi(workspace, self._message(guidance))
+                    except asyncio.TimeoutError:
+                        failure = "proposal_timeout"
+                finally:
+                    if not stream and (workspace / "pi.jsonl").is_file():  # charge the partial session
+                        stream = parse_pi_stream(
+                            (workspace / "pi.jsonl").read_text(encoding="utf-8", errors="replace"))
+                    cost += self._charge(stream, usage)
+                out = workspace / "view" / "out"
+                if failure is None and (out / "candidate.py").is_file() and (out / "pending.json").is_file():
+                    code = (out / "candidate.py").read_text(encoding="utf-8")
+                    pending = json.loads((out / "pending.json").read_text(encoding="utf-8"))
+                    break
+                failure = failure or "proposal_failed"
+                if not stream.get("retryable") or tries > len(RETRY_DELAYS_SECONDS) or self._stop.is_set():
+                    if stream.get("retryable"):
+                        failure = "rate_limited"
+                    break
+                try_dir = workspace / "tries" / f"{tries:02d}"
+                try_dir.mkdir(parents=True)
+                for name in ("pi.jsonl", "pi.stderr.txt", "view/out"):
+                    if (workspace / name).exists():
+                        shutil.move(str(workspace / name), str(try_dir / Path(name).name))
+                for name in ("view", "pi-home", "pi-tmp"):
+                    shutil.rmtree(workspace / name, ignore_errors=True)
+                await asyncio.sleep(RETRY_DELAYS_SECONDS[tries - 1])
         except asyncio.CancelledError:
             failure, terminal = "abandoned", "abandoned_at_shutdown"
-            if (workspace / "pi.jsonl").is_file():  # charge the partial session
-                stream = parse_pi_stream((workspace / "pi.jsonl").read_text(encoding="utf-8", errors="replace"))
         except Exception:
             failure = "proposal_failed"
             (workspace / "loop_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
-        cached = int(stream.get("cache_read_tokens") or 0)
-        usage = {
-            "input_tokens": int(stream.get("input_tokens") or 0) + int(stream.get("cache_write_tokens") or 0),
-            "cached_input_tokens": cached,
-            "output_tokens": int(stream.get("output_tokens") or 0),
-        }
-        if self.worker_provider == "deepseek":  # OpenEvolve's DeepSeek ledger prices cache reads as input
-            usage = {"input_tokens": usage["input_tokens"] + cached, "output_tokens": usage["output_tokens"]}
-        cost = self.ledger.price(usage)
-        self.ledger.add(usage)
 
         declared = pending.get("base_id")
         if guidance is not None:
@@ -459,11 +496,11 @@ class Search:
             attempt_id=attempt_id, iteration=iteration, scheduled_at=scheduled_at, guidance=guidance,
             parent_id=parent_id, parent=parent, code=code, pending=pending, valid=valid, metrics=metrics,
             artifacts=artifacts, failure=failure, terminal=terminal, cost=cost, usage=usage,
-            stream=stream, read_ids=read_ids,
+            stream=stream, read_ids=read_ids, tries=tries,
         )
 
     def _complete(self, *, attempt_id, iteration, scheduled_at, guidance, parent_id, parent, code, pending,
-                  valid, metrics, artifacts, failure, terminal, cost, usage, stream, read_ids) -> None:
+                  valid, metrics, artifacts, failure, terminal, cost, usage, stream, read_ids, tries=1) -> None:
         seq = self.next_seq
         self.next_seq += 1
         now = time.time()
@@ -487,7 +524,7 @@ class Search:
             target_island=0, evaluation_valid=valid, failure_stage=None if valid else (failure or "invalid"),
             child=child, artifacts=artifacts, metadata={"changes": changes},
             api_cost_usd=cost, usage=usage, inspiration_ids=read_ids,
-            pi={"returncode": stream.get("returncode"), "tool_calls": stream.get("tool_calls"),
+            pi={"returncode": stream.get("returncode"), "tool_calls": stream.get("tool_calls"), "tries": tries,
                 "read_count": len(stream.get("successful_read_paths") or [])},
             meta_intervention=guidance is not None,
             meta_audit_id=guidance.get("audit_id") if guidance else None,
@@ -514,12 +551,17 @@ class Search:
             self.breadth.on_completion(
                 seq=seq, attempt_id=attempt_id, at=completion["timestamp"], valid=valid,
                 cycles=metrics.get("cycles") if valid else None, child_id=program_id if valid else None,
-                guidance=guidance,
+                guidance=guidance, failure_stage=None if valid else (failure or "invalid"),
             )
 
     # ---------- scheduler ----------
 
+    def _can_launch(self) -> bool:
+        return (len(self._running) < MAX_PI_SESSIONS
+                and time.monotonic() - self._last_launch >= LAUNCH_SPACING_SECONDS)
+
     def _launch(self, guidance: dict[str, Any] | None) -> None:
+        self._last_launch = time.monotonic()
         iteration = self.next_iteration
         self.next_iteration += 1
         task = asyncio.create_task(self._attempt(iteration, guidance))
@@ -540,9 +582,10 @@ class Search:
             over_budget = self.ledger.total() >= self.budget
             past_deadline = time.monotonic() >= self.deadline
             if not over_budget:
-                while self.breadth is not None and (guidance := self.breadth.take_guidance()) is not None:
+                while (self.breadth is not None and self._can_launch()
+                       and (guidance := self.breadth.take_guidance()) is not None):
                     self._launch(guidance)
-                while (not past_deadline and self._ordinary_running() < NATIVE_CONCURRENCY
+                while (not past_deadline and self._can_launch() and self._ordinary_running() < NATIVE_CONCURRENCY
                        and (self.breadth is None or self.breadth.ordinary_allowed(len(self._running)))):
                     self._launch(None)
             # RSI-top finishes a triggered planner/cohort after the deadline, like OE/Shinka;
@@ -553,7 +596,7 @@ class Search:
             if not self._running:
                 await asyncio.sleep(1.0)
                 continue
-            done, _ = await asyncio.wait(self._running, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(self._running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 self._running.pop(task)
                 task.result()

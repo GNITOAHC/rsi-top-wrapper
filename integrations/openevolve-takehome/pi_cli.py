@@ -193,6 +193,11 @@ def build_pi_subprocess_env(
             json.dumps({"providers": {"cloudflare": cloudflare_provider_config()}}) + "\n",
             encoding="utf-8",
         )
+        # Workers AI answers bursts with 429; Pi's default 3 retries from 2 s give up in ~14 s.
+        (agent_dir / "settings.json").write_text(
+            json.dumps({"retry": {"enabled": True, "maxRetries": 8, "baseDelayMs": 5000}}) + "\n",
+            encoding="utf-8",
+        )
 
     if extra:
         env.update(extra)

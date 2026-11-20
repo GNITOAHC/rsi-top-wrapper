@@ -209,6 +209,11 @@ def export(*, name: str, baseline_run: Path, rsi_run: Path, horizon: float,
         "r": f"{reference_budget / spent:.1f}×", "d": f"${spent:.0f} vs. ${reference_budget:.0f}",
         "spent_usd": round(spent, 2),
     }
+    guided = [row for row in rsi.completions if row.get("meta_intervention")]
+    unproposed = sum(row.get("child") is None for row in guided)
+    if guided and unproposed > 0.1 * len(guided):
+        print(f"warning: {unproposed}/{len(guided)} guided directions never produced a proposal; "
+              "the dots overstate what RSI-top tried", file=sys.stderr)
     return {"frontier": entry, "cost": cost}
 
 

@@ -28,9 +28,16 @@ def fake_evaluate(path):
     return True, {"combined_score": 0.5, "cycles": cycles, "speedup": 147734 / cycles}, {}
 
 
-def install_fakes(monkeypatch, *, invalid_every=5):
+def install_fakes(monkeypatch, *, invalid_every=5, live=None):
+    live = live if live is not None else {"now": 0, "peak": 0}
+
     async def fake_pi(self, workspace, message):
-        await asyncio.sleep(0.01)
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            live["now"] -= 1
         iteration = int(workspace.name)
         out = workspace / "view" / "out"
         if iteration % invalid_every == invalid_every - 1:
@@ -45,6 +52,8 @@ def install_fakes(monkeypatch, *, invalid_every=5):
 
     monkeypatch.setattr(mh_loop.Search, "_run_pi", fake_pi)
     monkeypatch.setattr(mh_loop, "evaluate_program", fake_evaluate)
+    monkeypatch.setattr(mh_loop, "LAUNCH_SPACING_SECONDS", 0.0)
+    return live
 
 
 def run_search(output: Path, *, seconds: float, breadth=None, prefix=None):
@@ -141,7 +150,7 @@ def fake_planner_factory(directions=32):
 
 
 def test_breadth_trigger_dispatches_whole_cohort_and_resumes(tmp_path, monkeypatch):
-    install_fakes(monkeypatch, invalid_every=1000)
+    live = install_fakes(monkeypatch, invalid_every=1000)
     monkeypatch.setattr(mh_breadth.BreadthManager, "_plan", fake_planner_factory())
     search_dir = tmp_path / "mh-rsi" / "search"
     search_dir.mkdir(parents=True)
@@ -163,6 +172,7 @@ def test_breadth_trigger_dispatches_whole_cohort_and_resumes(tmp_path, monkeypat
     first = [row for row in journal if row["cohort_index"] == 0]
     assert sum(row["kind"] == "direction_assigned" for row in first) == 32
     assert sum(row["kind"] == "guided_attempt_terminal" for row in first) == 32
+    assert live["peak"] == mh_loop.MAX_PI_SESSIONS  # cohort queued behind the session cap
     request = json.loads((search_dir / "run/breadth_control/request_000.json").read_text())
     assert Path(request["normalized_attempts"]).is_file()
     guided = [row for row in rows(search_dir / "run/attempts.jsonl")
@@ -176,6 +186,44 @@ def test_breadth_trigger_dispatches_whole_cohort_and_resumes(tmp_path, monkeypat
     assert {row["id"] for row in catalog["programs"]} == set(
         json.loads(Path(request["checkpoint"]).joinpath("metadata.json").read_text())["islands"][0])
     assert (view / "search_history/dashboard_llm.jsonl").is_file()
+
+
+def test_rate_limited_session_is_retried_then_recorded_once(tmp_path, monkeypatch):
+    install_fakes(monkeypatch, invalid_every=1000)
+    succeed = mh_loop.Search._run_pi
+    calls = []
+
+    async def flaky_pi(self, workspace, message):
+        calls.append(workspace.name)
+        if calls.count(workspace.name) <= 2:
+            (workspace / "pi.jsonl").write_text('{"errorMessage":"429 status code (no body)"}\n')
+            return {"input_tokens": 7, "output_tokens": 0, "retryable": True, "returncode": 1}
+        return await succeed(self, workspace, message)
+
+    monkeypatch.setattr(mh_loop.Search, "_run_pi", flaky_pi)
+    monkeypatch.setattr(mh_loop, "RETRY_DELAYS_SECONDS", (0.0,) * 5)
+    search = run_search(tmp_path / "run", seconds=0.5)
+    completions = [row for row in rows(tmp_path / "run/attempts.jsonl") if row["event"] == "canonical_completion"]
+    first = next(row for row in completions if row["iteration"] == 0)
+    assert first["terminal"] == "committed" and first["pi"]["tries"] == 3
+    assert [row["iteration"] for row in completions].count(0) == 1
+    assert (tmp_path / "run/workspaces/00000/tries/02/pi.jsonl").is_file()
+    assert search.ledger.total() > 0
+
+
+def test_failed_directions_skip_rate_limited(tmp_path):
+    planner = tmp_path / "planner"
+    planner.mkdir()
+    (planner / "portfolio.json").write_text(json.dumps({"directions": [
+        {"task": "a", "mechanism_hypothesis": "x", "target_branch_id": "p1"}]}))
+    journal = tmp_path / "journal.jsonl"
+    journal.write_text("".join(json.dumps(row) + "\n" for row in [
+        {"kind": "direction_assigned", "cohort_index": 0, "generation": 7, "direction_index": 1},
+        {"kind": "guided_attempt_terminal", "cohort_index": 0, "generation": 7, "evaluation_valid": False,
+         "cycles": None, "failure_stage": "rate_limited", "completion_seq": 9},
+        {"kind": "guided_cohort_complete", "cohort_index": 0},
+    ]))
+    assert mh_breadth.failed_directions(existing=[], planner=planner, journal=journal, cohort=0) == []
 
 
 def test_failed_directions_memory_matches_shinka(tmp_path):

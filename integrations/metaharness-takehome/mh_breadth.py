@@ -126,6 +126,8 @@ def failed_directions(
     for generation, index in sorted(assignments.items(), key=lambda item: item[1]):
         direction = directions[index]
         terminal = terminals.get(generation, {})
+        if terminal.get("failure_stage") == "rate_limited":
+            continue  # never proposed: not evidence against the direction
         cycles = terminal.get("cycles")
         if terminal.get("evaluation_valid") is not True or not isinstance(cycles, (int, float)):
             outcome, delta = "invalid", None
@@ -237,14 +239,16 @@ class BreadthManager:
                       donor_branch_ids=guidance["donor_branch_ids"])
 
     def on_completion(self, *, seq: int, attempt_id: str, at: float, valid: bool, cycles: float | None,
-                      child_id: str | None, guidance: dict[str, Any] | None) -> None:
+                      child_id: str | None, guidance: dict[str, Any] | None,
+                      failure_stage: str | None = None) -> None:
         self._terminal_at[attempt_id] = at
         iteration = self._iteration_by_attempt.get(attempt_id, -1)
         guided = iteration in self._guided_iterations
         if guided:
             self._guided_terminal.add(iteration)
             self._journal("guided_attempt_terminal", generation=iteration, completion_seq=seq,
-                          evaluation_valid=valid, child_id=child_id, cycles=cycles)
+                          evaluation_valid=valid, child_id=child_id, cycles=cycles,
+                          failure_stage=failure_stage)
         if valid and cycles is not None:
             if self._best_cycles is None or cycles < self._best_cycles:
                 self._best_cycles = cycles

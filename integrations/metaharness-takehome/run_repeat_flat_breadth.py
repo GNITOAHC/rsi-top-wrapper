@@ -132,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         "planner": {"model": args.planner_model, "provider": args.planner_provider,
                     "reasoning": args.planner_reasoning, "calls": 4, "directions_per_call": 8,
                     "metrics_per_call": 15},
+        "guided_concurrency": mh_loop.MAX_PI_SESSIONS,
         "credential_values_recorded": False,
     }
     prefix = None
